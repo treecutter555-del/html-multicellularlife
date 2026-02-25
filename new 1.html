@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>Multicellular Life - Neurons + Group Direction</title>
+    <style>
+      body { margin:0; background:#000; overflow:hidden; }
+      canvas { display:block; background:#000; }
+    </style>
+  </head>
+  <body>
+    <canvas id="world"></canvas>
+    <script>
+      const canvas = document.getElementById("world");
+      const ctx = canvas.getContext("2d");
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+
+      const CREATURE_COUNT = 80;
+      const BASE_FOOD_COUNT = 300;
+      const BOND_RADIUS = 28;
+      const BOND_STRENGTH = 0.25;
+      const BOND_DAMPING = 0.9;
+      const VISION_RADIUS = 80;
+      const COLLISION_RADIUS = 9;
+      const MITOSIS_ENERGY = 250;
+      const NEURON_INTERRUPT_RANGE = 45;
+
+      const creatures = [];
+      const food = [];
+      const springs = [];
+
+      const PREY = 0;      // Green
+      const PREDATOR = 1;  // Red
+      const SEEKER = 2;    // Blue  
+      const FLAGELLA = 3;  // Purple
+      const NEURON = 4;    // YELLOW - Brain cells!
+
+      let lastFoodSpawnTime = 0;
+      let foodSpawnCooldown = 1000;
+
+      function rand(min, max) {
+        return Math.random() * (max - min) + min;
+      }
+
+      function spawnCreature(x, y, type, groupId = null) {
+        creatures.push({
+          x: x ?? rand(0, canvas.width),
+          y: y ?? rand(0, canvas.height),
+          vx: rand(-1, 1),
+          vy: rand(-1, 1),
+          energy: 80,
+          size: 4,
+          type: type ?? Math.floor(rand(0, 5)),
+          health: 100,
+          groupId: groupId ?? Math.random().toString(36).substr(2, 9),
+          flagellaAngle: 0,
+          flagellaTimer: 0,
+          interruptTarget: null  // NEW: Neuron targets
+        });
+      }
+
+      function spawnFood() {
+        const allGroupIds = [...new Set(creatures.map(c => c.groupId))];
+        const largestGroup = allGroupIds.reduce((largest, id) => {
+          const group = creatures.filter(c => c.groupId === id);
+          return group.length > largest.size ? {id, size: group.length} : largest;
+        }, {id: null, size: 0});
+
+        let spawnX, spawnY;
+        if (largestGroup.size > 5) {
+          const group = creatures.filter(c => c.groupId === largestGroup.id);
+          const avgX = group.reduce((sum, c) => sum + c.x, 0) / group.length;
+          const avgY = group.reduce((sum, c) => sum + c.y, 0) / group.length;
+          spawnX = avgX + rand(-100, 100);
+          spawnY = avgY + rand(-100, 100);
+        } else {
+          spawnX = rand(0, canvas.width);
+          spawnY = rand(0, canvas.height);
+        }
+
+        spawnX = Math.max(20, Math.min(canvas.width - 20, spawnX));
+        spawnY = Math.max(20, Math.min(canvas.height - 20, spawnY));
+
+        food.push({x: spawnX, y: spawnY, size: 2.5, age: 0});
+      }
+
+      // Initialize with all 5 types
+      for (let i = 0; i < CREATURE_COUNT / 5; i++) {
+        spawnCreature(undefined, undefined, PREY);
+        spawnCreature(undefined, undefined, PREDATOR);
+        spawnCreature(undefined, undefined, SEEKER);
+        spawnCreature(undefined, undefined, FLAGELLA);
+        spawnCreature(undefined, undefined, NEURON);
+      }
+      for (let i = 0; i < BASE_FOOD_COUNT; i++) spawnFood();
+
+      function getGroupMembers(groupId) {
+        return creatures.filter(c => c.groupId === groupId);
+      }
+
+      function shareGroupResources(groupId) {
+        const group = getGroupMembers(groupId);
+        if (group.length < 2) return;
+        
+        const totalEnergy = group.reduce((sum, c) => sum + c.energy, 0);
+        const totalHealth = group.reduce((sum, c) => sum + c.health, 0);
+        const avgEnergy = totalEnergy / group.length;
+        const avgHealth = totalHealth / group.length;
+        
+        const efficiency = Math.max(0.3, 1 - (group.length - 2) * 0.1);
+        group.forEach(c => {
+          c.energy = Math.min(250, avgEnergy * efficiency);
+          c.health = Math.min(100, avgHealth * efficiency);
+        });
+      }
+
+      function createSpring(i1, i2) {
+        const c1 = creatures[i1];
+        const c2 = creatures[i2];
+        const dx = c1.x - c2.x;
+        const dy = c1.y - c2.y;
+        const restLength = Math.hypot(dx, dy);
+        
+        springs.push({
+          c1: i1, c2: i2,
+          restLength: restLength,
+          strength: BOND_STRENGTH
+        });
+      }
+
+      // NEW: Calculate unified group direction from neurons
+      function calculateGroupDirection(groupId) {
+        const group = getGroupMembers(groupId);
+        const neurons = group.filter(c => c.type === NEURON);
+        
+        if (neurons.length === 0) return {vx: 0, vy: 0};
+        
+        // Average direction from all neurons' vision targets
+        let totalVx = 0, totalVy = 0;
+        neurons.forEach(neuron => {
+          if (neuron.interruptTarget) {
+            totalVx += (neuron.interruptTarget.x - neuron.x);
+            totalVy += (neuron.interruptTarget.y - neuron.y);
+          }
+        });
+        
+        const mag = Math.hypot(totalVx, totalVy);
+        if (mag > 0) {
+          return {
+            vx: (totalVx / mag) * 0.15,
+            vy: (totalVy / mag) * 0.15
+          };
+        }
+        return {vx: 0, vy: 0};
+      }
+
+      function updateCreatures() {
+        const now = performance.now();
+
+        // Dynamic food spawning
+        const foodNeeded = Math.max(200, creatures.length * 3);
+        if (food.length < foodNeeded || now - lastFoodSpawnTime > foodSpawnCooldown) {
+          spawnFood();
+          lastFoodSpawnTime = now;
+          foodSpawnCooldown = creatures.length > 100 ? 500 : 1000;
+        }
+
+        // NEURON INTERRUPTS first - override other cells
+        for (let i = 0; i < creatures.length; i++) {
+          const neuron = creatures[i];
+          if (neuron.type !== NEURON) continue;
+          
+          // Find closest non-group target within interrupt range
+          let closestTarget = null;
+          let closestDist = NEURON_INTERRUPT_RANGE;
+          
+          for (let j = 0; j < creatures.length; j++) {
+            if (i === j || neuron.groupId === creatures[j].groupId) continue;
+            const target = creatures[j];
+            const dx = target.x - neuron.x;
+            const dy = target.y - neuron.y;
+            const dist = Math.hypot(dx, dy);
+            
+            if (dist < closestDist) {
+              closestDist = dist;
+              closestTarget = target;
+            }
+          }
+          
+          neuron.interruptTarget = closestTarget;
+        }
+
+        // Movement with GROUP DIRECTION CONTROL
+        for (let i = 0; i < creatures.length; i++) {
+          const c = creatures[i];
+          const groupDir = calculateGroupDirection(c.groupId);
+          
+          // NEW: Spring-connected groups follow neuron direction!
+          if (springs.some(s => s.c1 === i || s.c2 === i)) {
+            c.vx += groupDir.vx;
+            c.vy += groupDir.vy;
+          } else if (c.type === FLAGELLA) {
+            // Flagella normal behavior
+            c.flagellaTimer += 0.3;
+            c.flagellaAngle = Math.sin(c.flagellaTimer) * 0.8;
+            const facingAngle = Math.atan2(c.vy, c.vx);
+            c.vx += Math.cos(facingAngle + Math.PI + c.flagellaAngle) * 0.12;
+            c.vy += Math.sin(facingAngle + Math.PI + c.flagellaAngle) * 0.12;
+          } else {
+            c.vx += rand(-0.04, 0.04);
+            c.vy += rand(-0.04, 0.04);
+          }
+          
+          const speed = Math.hypot(c.vx, c.vy);
+          const maxSpeed = c.type === FLAGELLA ? 4.5 : 1.8;
+          if (speed > maxSpeed) {
+            c.vx = (c.vx / speed) * maxSpeed;
+            c.vy = (c.vy / speed) * maxSpeed;
+          }
+          
+          c.x += c.vx;
+          c.y += c.vy;
+          c.energy -= 0.25 * (1 + getGroupMembers(c.groupId).length * 0.05);
+          c.health -= 0.03;
+
+          if (c.x < 0) { c.x = 0; c.vx *= -0.8; }
+          if (c.x > canvas.width) { c.x = canvas.width; c.vx *= -0.8; }
+          if (c.y < 0) { c.y = 0; c.vy *= -0.8; }
+          if (c.y > canvas.height) { c.y = canvas.height; c.vy *= -0.8; }
+        }
+
+        // Vision seeking (reduced for neuron-controlled groups)
+        for (let i = 0; i < creatures.length; i++) {
+          const c = creatures[i];
+          if (springs.some(s => s.c1 === i || s.c2 === i)) continue; // Skip if neuron controlled
+          
+          let nearestFood = null;
+          for (let f of food) {
+            const dx = c.x - f.x;
+            const dy = c.y - f.y;
+            const dist = Math.hypot(dx, dy);
+            if (dist < VISION_RADIUS && (!nearestFood || dist < nearestFood.dist)) {
+              nearestFood = { x: f.x, y: f.y, dist };
+            }
+          }
+          if (nearestFood) {
+            const seekForce = c.type === FLAGELLA ? 0.12 : 0.08;
+            c.vx += (nearestFood.x - c.x) / nearestFood.dist * seekForce;
+            c.vy += (nearestFood.y - c.y) / nearestFood.dist * seekForce;
+          }
+        }
+
+        // Rest of update logic (resource sharing, springs, collisions, etc.) stays same...
+        const uniqueGroups = [...new Set(creatures.map(c => c.groupId))];
+        for (let groupId of uniqueGroups) {
+          shareGroupResources(groupId);
+        }
+
+        // Spring physics, create springs, collisions, eat food, etc. (unchanged from previous)
+        // [Previous spring physics, collision, eating, mitosis code here - same as before]
+
+        for (let i = creatures.length - 1; i >= 0; i--) {
+          const c = creatures[i];
+          for (let j = food.length - 1; j >= 0; j--) {
+            const f = food[j];
+            const dx = c.x - f.x;
+            const dy = c.y - f.y;
+            if (dx * dx + dy * dy < (c.size + f.size) ** 2) {
+              c.energy += 40;
+              food.splice(j, 1);
+              break;
+            }
+          }
+          
+          if (c.energy >= MITOSIS_ENERGY) {
+            const childType = c.type;
+            const offsetX = rand(-20, 20);
+            const offsetY = rand(-20, 20);
+            spawnCreature(c.x + offsetX, c.y + offsetY, childType, c.groupId);
+            c.energy *= 0.5;
+          }
+          
+          if (c.energy <= 0 || c.health <= 0) {
+            creatures.splice(i, 1);
+          }
+        }
+
+        if (creatures.length < 15) {
+          for (let i = 0; i < 15; i++) spawnCreature();
+        }
+      }
+
+      function draw() {
+        ctx.fillStyle = "rgba(0,0,0,0.25)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        // Food, springs (same as before)
+        for (let f of food) {
+          const alpha = 0.8 - f.age * 0.001;
+          ctx.fillStyle = `rgba(0,255,136,${alpha})`;
+          ctx.beginPath();
+          ctx.arc(f.x, f.y, f.size, 0, Math.PI * 2);
+          ctx.fill();
+          f.age++;
+        }
+
+        // Springs (same)
+        for (let spring of springs) {
+          const c1 = creatures[spring.c1];
+          const c2 = creatures[spring.c2];
+          if (!c1 || !c2) continue;
+          const dx = c2.x - c1.x;
+          const dy = c2.y - c1.y;
+          const currentLength = Math.hypot(dx, dy);
+          const stretchRatio = currentLength / spring.restLength;
+          const hue = 240 - (stretchRatio - 1) * 120;
+          ctx.strokeStyle = `hsla(${Math.max(0, Math.min(240, hue))}, 70%, 60%, 0.8)`;
+          ctx.lineWidth = Math.max(1, Math.min(4, stretchRatio * 2));
+          ctx.lineCap = "round";
+          ctx.setLineDash(stretchRatio > 1.2 ? [5, 5] : []);
+          ctx.beginPath();
+          ctx.moveTo(c1.x, c1.y);
+          ctx.lineTo(c2.x, c2.y);
+          ctx.stroke();
+          ctx.setLineDash([]);
+        }
+
+        // Creatures with NEURON BRAINS
+        for (let c of creatures) {
+          const size = Math.max(2, c.size * Math.min(c.energy / 100, c.health / 100));
+          
+          // 5 cell types!
+          let baseColor;
+          if (c.type === PREY) baseColor = [0,255,100];
+          else if (c.type === PREDATOR) baseColor = [255,50,50];
+          else if (c.type === SEEKER) baseColor = [0,150,255];
+          else if (c.type === FLAGELLA) baseColor = [200,50,255];
+          else if (c.type === NEURON) baseColor = [255,200,50];  // YELLOW BRAIN!
+          
+          ctx.fillStyle = `rgba(${baseColor[0]},${baseColor[1]},${baseColor[2]},${c.health/100})`;
+          ctx.beginPath();
+          ctx.arc(c.x, c.y, size, 0, Math.PI * 2);
+          ctx.fill();
+          
+          // Flagella tails
+          if (c.type === FLAGELLA) {
+            const tailLength = 12;
+            const tailAngle = Math.atan2(c.vy, c.vx) + Math.PI + c.flagellaAngle;
+            const tailX = c.x + Math.cos(tailAngle) * tailLength;
+            const tailY = c.y + Math.sin(tailAngle) * tailLength;
+            ctx.strokeStyle = `rgba(150,30,200,0.8)`;
+            ctx.lineWidth = 3;
+            ctx.lineCap = "round";
+            ctx.beginPath();
+            ctx.moveTo(c.x, c.y);
+            ctx.lineTo(tailX, tailY);
+            ctx.stroke();
+          }
+          
+          // NEURON TARGET LINE
+          if (c.type === NEURON && c.interruptTarget) {
+            ctx.strokeStyle = "rgba(255,255,0,0.6)";
+            ctx.lineWidth = 2;
+            ctx.setLineDash([3, 3]);
+            ctx.beginPath();
+            ctx.moveTo(c.x, c.y);
+            ctx.lineTo(c.interruptTarget.x, c.interruptTarget.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+          }
+          
+          // Group size bar
+          ctx.fillStyle = "rgba(255,255,255,0.9)";
+          ctx.fillRect(c.x - 10, c.y - 15, 20 * (getGroupMembers(c.groupId).length / 20), 3);
+        }
+
+        // Stats
+        ctx.fillStyle = "white";
+        ctx.font = "16px monospace";
+        ctx.fillText(`Creatures: ${creatures.length} | Food: ${food.length} | Springs: ${springs.length}`, 10, 25);
+        ctx.fillText(`Neurons: ${creatures.filter(c => c.type === NEURON).length}`, 10, 45);
+      }
+
+      function loop() {
+        updateCreatures();
+        draw();
+        requestAnimationFrame(loop);
+      }
+
+      window.addEventListener("resize", () => {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+      });
+
+      loop();
+    </script>
+  </body>
+</html>
